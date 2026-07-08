@@ -6,7 +6,7 @@
 
 > Not "AI that predicts a forecast." AI that simulates the *negotiation* behind the forecast — and shows its work.
 
-![Demo](docs/assets/demo.gif)
+![Demo](DOCS/assets/demo.gif)
 
 ---
 
