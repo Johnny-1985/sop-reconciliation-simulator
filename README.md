@@ -17,10 +17,11 @@ The design choices here (inventory-aware reasoning, new-product-launch handling,
 ## What it does
 
 1. Pick a scenario (a live planning conflict: demand surge, regulatory supply disruption, oversupply, capacity allocation across markets, or a new product launch with no sales history).
-2. Run the review. Three sequential AI calls simulate the meeting:
+2. Run the review. The system simulates the meeting with a variable number of AI calls depending on the situation:
    - **Sales Demand Agent** argues for volume, grounded in market data (or, for new launches, in market-sizing/analog reasoning rather than a trend that doesn't exist yet).
    - **Supply/Procurement Agent** responds with feasibility limits, lead times, and — critically — current inventory position against a 1.5-month target stock level.
-   - **Harmonizer** does not average the two. It makes a judgment call, month by month, and states which factor tipped the decision each time.
+   - **Finance Agent** joins *only* if inventory surplus has persisted 2+ consecutive months — a dead-stock risk that Sales and Procurement aren't positioned to resolve. It weighs holding cost against markdown vs. write-off.
+   - **Harmonizer** does not average the positions. It makes a judgment call, month by month, and states which factor tipped the decision each time — including whether it accepted or overrode Finance's pricing recommendation.
 3. Review the **Decision Trace** — an expandable, month-by-month ledger showing exactly what each side requested, what was decided, and why. This is the part built specifically so an approver never has to take the final number on faith.
 
 ## Architecture
@@ -42,23 +43,35 @@ The design choices here (inventory-aware reasoning, new-product-launch handling,
 │ Supply/Procurement   │  Argues feasibility; weighs inventory surplus/deficit
 │ Agent                │  against a 1.5-month target stock level
 └──────────┬───────────┘
-           │ (sees both outputs)
-           ▼
-┌─────────────────────┐
-│ Harmonizer           │  Integrated Planning Manager persona. Produces one final
-│                      │  number per month + a per-month reasoning trace
-└──────────┬───────────┘
            │
            ▼
-   Executive Summary + Decision Trace (expandable, auditable)
+   ┌─── dead_stock_trigger_month set? ───┐
+   │ NO → skip to Harmonizer             │ YES ↓
+   │                                      │
+   │                          ┌─────────────────────┐
+   │                          │ Finance Agent        │  Holding cost vs. markdown
+   │                          │ (conditional)        │  vs. write-off, with numbers
+   │                          └──────────┬───────────┘
+   └──────────────────────────────────────┘
+                              │ (sees all prior outputs)
+                              ▼
+                   ┌─────────────────────┐
+                   │ Harmonizer           │  Integrated Planning Manager persona.
+                   │                      │  Final volume + (if applicable) pricing
+                   │                      │  decision, both with a reasoning trace
+                   └──────────┬───────────┘
+                              │
+                              ▼
+           Executive Summary + Decision Trace (expandable, auditable)
 ```
 
-Three API calls per review. No infinite loops, no hidden state — every output is a structured JSON object so the UI can render it directly.
+Three API calls per review, or four when the Finance Agent is triggered. No infinite loops, no hidden state — every output is a structured JSON object so the UI can render it directly.
 
 ## Key differentiators
 
 - **Explainable by design, not by afterthought.** The Harmonizer's `decision_trace` ties every final number to a specific, month-level reason drawn from the two agents' actual arguments — not one generic paragraph for the whole plan.
 - **Inventory-aware, not just capacity-aware.** Procurement's position factors in whether current stock is already above or below a 1.5-month target, which changes the argument even when raw production capacity would technically allow more supply.
+- **The agent roster adapts to the situation.** The Finance Agent is not always in the room — it's only convened when the data shows a genuine dead-stock risk (inventory surplus persisting 2+ consecutive months), the same way a real planning manager wouldn't put a write-off decision on every meeting's agenda. This conditional orchestration, not a fixed pipeline, is deliberate.
 - **New product launches are handled differently, on purpose.** When a scenario has no sales history, the Sales Agent is required to say so and switch to market-sizing/analog reasoning — and the Harmonizer treats that as higher uncertainty, not as equivalent confidence to an established product.
 - **Built on real planning judgment.** The scenario structure, unit conventions (MWp for modules via POWERCLASS × quantity, unit counts for inverters/ESS), and lead-time assumptions reflect actual solar-industry S&OP practice, not a generic supply-chain template.
 
@@ -90,8 +103,8 @@ This demo calls the Anthropic API directly from the browser. It runs live inside
 
 | Phase | Scope |
 |---|---|
-| **Phase 1 (this repo)** | 2 agents (Sales, Procurement) + Harmonizer, 5 pre-built scenarios, full decision-trace explainability, inventory-aware logic, new-launch handling |
-| **Phase 2** | Finance Agent (margin/write-off perspective), dead-stock/liquidation logic (triggered when inventory surplus persists 2+ consecutive months), multi-scenario history, standalone hosted demo with backend proxy |
+| **Phase 1** | 2 agents (Sales, Procurement) + Harmonizer, 5 pre-built scenarios, full decision-trace explainability, inventory-aware logic, new-launch handling |
+| **Phase 2 (in progress)** | ✅ Finance Agent (margin/write-off perspective) + dead-stock/liquidation logic, conditionally triggered when inventory surplus persists 2+ consecutive months · Next: result history, standalone hosted demo with backend proxy |
 | **Phase 3** | Reviewer Agent for automated quality checks, adjustable What-if parameters (forecast %, lead time, promotion on/off) |
 
 ## About this project
