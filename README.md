@@ -1,8 +1,12 @@
 # S&OP Reconciliation Simulator
 
+**Status: 🚧 Actively developed — Phase 2 in progress.** See [Roadmap](#roadmap) for what's shipped vs. planned.
+
 **A multi-agent AI simulation of a real Sales–Supply demand/supply reconciliation meeting — the kind of decision an Integrated Planning Manager runs every month, made explainable and auditable.**
 
 > Not "AI that predicts a forecast." AI that simulates the *negotiation* behind the forecast — and shows its work.
+
+![Demo](docs/assets/demo.gif)
 
 ---
 
