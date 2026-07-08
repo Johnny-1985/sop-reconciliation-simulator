@@ -127,14 +127,16 @@ S&OP 회의에서 가장 보편적이고 누구나 이해하는 긴장 구도를
 
 | Phase | 내용 | 상태 |
 |---|---|---|
-| Phase 1 | Agent 2개 + 간단 Harmonizer, 단일 시나리오, Claude Artifact 데모 | 시작 예정 |
-| Phase 2 | Finance Agent 추가(원가·마진·손실처리 관점), 판매 부진/데드스탁 청산 방향성 로직, 3~5개 시나리오 선택 가능, 결과 히스토리 저장 | 보류 |
+| Phase 1 | Agent 2개 + 간단 Harmonizer, 단일 시나리오, Claude Artifact 데모 | 완료 |
+| Phase 2 | Finance Agent 추가(원가·마진·손실처리 관점), 판매 부진/데드스탁 청산 방향성 로직 | 진행 중 (Finance Agent + 조건부 오케스트레이션 완료) |
+| Phase 2 (계속) | 결과 히스토리 저장, 시나리오 선택 유지, 백엔드 프록시로 공개 배포 | 보류 |
 | Phase 3 | Reviewer Agent(품질 검증), 실행 가능한 What-if 파라미터 조정 UI | 보류 |
 
-**Phase 2 데드스탁/판매 부진 로직 (설계 메모):**
-- 트리거 조건: `inventory_gap`이 2개월 이상 연속 양수(재고 과잉)인 경우 데드스탁 리스크로 플래그.
-- 이때 볼륨 결정(Sales vs Procurement 구도)만으로는 부족 — Finance Agent가 참여해 "가격 인하(마크다운) vs 손실 처리(write-off) vs 유지" 중 원가·마진 영향을 비교해 제안.
-- 시나리오 C(Germany Oversupply)가 이미 이 조건에 정확히 부합하므로, Phase 2에서 별도 시나리오를 새로 만들 필요 없이 기존 시나리오를 확장해 재사용 가능.
+**Phase 2 데드스탁/판매 부진 로직 (구현 완료):**
+- 트리거 조건: `inventory_gap`이 **2개월 이상 연속 양수**(재고 과잉)인 경우 `dead_stock_trigger_month`에 첫 트리거 월이 자동 기록됨 (build_data.py에서 계산).
+- 트리거가 있는 시나리오에서만 **Finance Agent가 조건부로 소집**되어 hold/markdown/write-off 3가지 옵션의 월간 재고보유비용(연 18% 가정)을 비교 제시.
+- Harmonizer는 Finance의 제안을 그대로 받아들이거나 뒤집을 수 있으며, 뒤집을 경우 그 이유를 `pricing_decision.rationale`에 명시 — 이 역시 승인자 뷰에서 강조 표시됨.
+- 시나리오 C(Germany Oversupply)가 9월에 정확히 트리거되는 것을 검증 완료.
 
 ## 8. 포트폴리오 서사 (인터뷰용)
 

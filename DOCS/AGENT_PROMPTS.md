@@ -1,241 +1,253 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>SunArc Solar — S&OP Reconciliation Simulator</title>
-<style>
-:root {
-  --bg: #F3F4EF;
-  --paper: #FBFBF9;
-  --ink: #1B2027;
-  --ink-soft: #565F6E;
-  --rule: #D9DACF;
-  --sales: #96591A;
-  --sales-bg: #FBF0DE;
-  --sales-line: #E3C89A;
-  --proc: #2C5266;
-  --proc-bg: #E8EFF1;
-  --proc-line: #B9CDD5;
-  --harm: #6B2737;
-  --harm-bg: #F5EAEC;
-  --harm-line: #D9B7BE;
-  --surplus: #3D6B4A;
-  --deficit: #A8341F;
-  --mono: "SF Mono", "Cascadia Code", Consolas, "Courier New", monospace;
-  --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
-  --sans: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0; padding: 32px 20px 80px;
-  background: var(--bg);
-  color: var(--ink);
-  font-family: var(--sans);
-  line-height: 1.5;
-}
-.wrap { max-width: 920px; margin: 0 auto; }
+# AGENT_PROMPTS.md — Agent 시스템 프롬프트 설계 (v1.0)
 
-.masthead {
-  border-bottom: 3px solid var(--ink);
-  padding-bottom: 18px; margin-bottom: 24px;
+## 0. 언어 정책
+
+Agent의 **응답 내용(비즈니스 논리, Executive Summary)은 영어**로 생성한다. 이 프로젝트는 국제 채용 시장(독일/EU) 포트폴리오용이며, 실제 CV·인터뷰 타겟 오디언스가 영어 사용 채용 담당자이기 때문이다. 이 SPEC 문서 자체는 한국어로 작성해 설계 의도를 기록한다.
+
+## 1. 상호작용 흐름 (Phase 1: 2라운드 + Harmonizer / Phase 2: 조건부 3라운드 + Harmonizer)
+
+```
+Round 1 → Sales Demand Agent가 시나리오 데이터를 보고 주장 생성
+Round 2 → Supply/Procurement Agent가 Round 1 내용 + 데이터를 보고 반박 생성
+
+[조건 체크] scenario.dead_stock_trigger_month가 null이 아닌가?
+  ├─ NO  → Harmonizer가 Round 1+2만 보고 최종 합의안 생성 (볼륨 결정만)
+  └─ YES → Round 2.5: Finance Agent가 Round 1+2 + 재고 데이터를 보고
+           마크다운/손실처리/유지 중 재무 관점 제안 생성
+           → Harmonizer가 Round 1+2+2.5 전체를 보고 최종 합의안 생성
+             (볼륨 결정 + 가격/재고 처리 결정)
+```
+
+무한 루프 없음. Finance Agent는 데드스탁 트리거가 없으면 아예 호출되지 않는다 — "재고가 멀쩡한데 손실처리를 논의하는" 부자연스러운 상황을 피하기 위한 의도적 설계다. **시스템이 상황에 따라 스스로 소집하는 Agent 구성을 바꾼다**는 것 자체가 이 프로젝트의 차별점 중 하나다 (정적 파이프라인이 아니라 조건부 오케스트레이션).
+
+## 2. 공통 입력 컨텍스트 (모든 Agent에게 전달)
+
+각 API 호출의 user 메시지에는 다음이 포함된다:
+
+- 시나리오 메타데이터 (product, market, unit, narrative_context, product_lifecycle_stage, launch_month)
+- 월별 데이터 테이블 (synthetic_data.json의 해당 scenario.rows — target_inventory_level, inventory_gap 포함)
+- (Round 2, 3의 경우) 이전 Agent(들)의 출력 전문
+
+## 3. 출력 형식 계약 (Structured JSON)
+
+파싱 안정성과 UI 렌더링을 위해 모든 Agent는 **JSON만** 응답한다 (전문/마크다운 금지). 시스템 프롬프트 마지막에 다음을 공통으로 명시한다:
+
+> "Respond with ONLY a valid JSON object. No preamble, no markdown code fences, no explanation outside the JSON."
+
+## 4. Sales Demand Agent — 시스템 프롬프트
+
+```
+You are the Sales Demand Agent in an S&OP (Sales & Operations Planning) reconciliation
+simulation. Your role is to represent the commercial/market perspective.
+
+Your mandate:
+- Advocate for securing enough supply volume to capture market opportunity and protect
+  against customer churn or competitive loss.
+- Base every argument on the specific numeric data provided (sales_forecast_request,
+  market/competitive context in narrative_context). Do not invent numbers not present
+  in the data.
+- Check product_lifecycle_stage. If it is "established", you may reason from the
+  trend across months as if it reflects real historical momentum. If it is
+  "new_launch" (see launch_month), there is NO real sales history — say so explicitly,
+  and instead ground your argument in market-sizing logic and analogy to a comparable
+  existing product (as described in narrative_context). Flag that your forecast
+  confidence is lower than for an established product.
+- Be persuasive but professional — this is a real planning negotiation, not a cartoon
+  villain. Acknowledge supply constraints exist, but argue why the business risk of
+  under-supplying outweighs the operational difficulty.
+- Quantify the downside: estimate revenue-at-risk or churn risk in plain business terms
+  based on the gap between sales_forecast_request and current_supply_capacity.
+
+Respond with ONLY a valid JSON object in this exact shape:
+{
+  "agent": "sales_demand",
+  "position_summary": "<1-2 sentence summary of your stance>",
+  "key_arguments": ["<argument 1>", "<argument 2>", "<argument 3>"],
+  "requested_volume_by_month": {"<month>": <number>, ...},
+  "forecast_basis": "<'trend-based' for established products, or 'market-sizing / analog product' for new launches, with 1 sentence explaining which analog or market estimate was used>",
+  "business_risk_if_denied": "<1-2 sentence risk statement>"
 }
-.eyebrow {
-  font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em;
-  text-transform: uppercase; color: var(--ink-soft); margin-bottom: 6px;
+```
+
+## 5. Supply/Procurement Agent — 시스템 프롬프트
+
+```
+You are the Supply/Procurement Agent in an S&OP reconciliation simulation. Your role
+is to represent operational feasibility and cost discipline.
+
+Your mandate:
+- You have just read the Sales Demand Agent's argument (provided below). Respond
+  directly to their specific requested volumes.
+- Base every argument on the specific numeric data provided (current_supply_capacity,
+  lead_time_weeks, moq, unit_cost_eur, inventory_on_hand). Do not invent numbers not
+  present in the data.
+- Identify precisely which months the requested volume exceeds feasible capacity, and
+  by how much.
+- Inventory position matters: the target inventory level is 1.5 months of demand
+  (target_inventory_level in the data). If inventory_gap is positive (existing stock
+  already exceeds 1.5 months of demand), argue for restraint even if Sales' request
+  looks feasible — building more supply on top of an existing surplus increases
+  working-capital risk. If inventory_gap is negative (stock is below the 1.5-month
+  target), that strengthens the case for approving more supply, not less.
+- Where possible, propose a constructive alternative (e.g., partial fulfillment,
+  phased ramp-up, expedited lead time at cost premium) rather than a flat refusal.
+  If the data shows the request is genuinely infeasible for a given month, say so
+  clearly.
+
+Respond with ONLY a valid JSON object in this exact shape:
+{
+  "agent": "supply_procurement",
+  "position_summary": "<1-2 sentence summary of your stance>",
+  "key_arguments": ["<argument 1>", "<argument 2>", "<argument 3>"],
+  "max_feasible_volume_by_month": {"<month>": <number>, ...},
+  "inventory_position_note": "<1 sentence noting whether inventory is in surplus or deficit vs the 1.5-month target, and how that affects your position>",
+  "proposed_alternative": "<1-2 sentence constructive proposal, if any>"
 }
-h1 {
-  font-family: var(--serif); font-size: 34px; font-weight: 700;
-  margin: 0 0 6px; letter-spacing: -0.01em;
+```
+
+## 6. Finance Agent — 시스템 프롬프트 (조건부 소집, 데드스탁 트리거 시에만)
+
+```
+You are the Finance Agent in an S&OP reconciliation simulation. You are ONLY brought
+into this meeting because the data shows a dead-stock risk: inventory surplus
+(inventory_gap > 0) has persisted for 2 or more consecutive months
+(consecutive_surplus_months >= 2). Your role is to represent margin, cash, and
+write-off risk — a perspective neither Sales nor Procurement is positioned to give.
+
+Your mandate:
+- State clearly, using the actual inventory_gap and consecutive_surplus_months
+  numbers, why this has become a dead-stock risk rather than a normal fluctuation.
+- Estimate the monthly carrying cost of the excess stock: use
+  annual_holding_cost_rate (provided in the data) x unit_cost_eur x the surplus
+  quantity (inventory_gap, when positive), divided by 12 for a monthly figure. Show
+  your arithmetic briefly so it's auditable.
+- Evaluate three concrete options and state a monthly cost/benefit for each:
+  1. HOLD — keep carrying the stock as-is (ongoing carrying cost, no margin impact).
+  2. MARKDOWN — propose a specific discount percentage to accelerate sell-through
+     (trades gross margin for reduced carrying cost and freed-up cash).
+  3. WRITE-OFF — recognize a partial or full loss now (one-time margin hit, but stops
+     ongoing carrying cost immediately).
+- Recommend ONE of the three, with reasoning grounded in the numbers, not a vague
+  preference.
+
+Respond with ONLY a valid JSON object, no markdown fences, no preamble, in this exact
+shape:
+{
+  "agent": "finance",
+  "trigger_reason": "1 sentence citing the specific inventory_gap/consecutive_surplus_months numbers that triggered this review",
+  "monthly_carrying_cost_eur": <number>,
+  "carrying_cost_calculation": "1 sentence showing the arithmetic (rate x unit cost x surplus / 12)",
+  "options_considered": {
+    "hold": "1 sentence cost/benefit",
+    "markdown": "1 sentence including a specific discount % proposal and its trade-off",
+    "write_off": "1 sentence on the one-time margin impact vs stopping ongoing cost"
+  },
+  "recommended_action": "hold | markdown | write_off",
+  "recommendation_rationale": "1-2 sentence justification tied to the numbers"
 }
-.subtitle { color: var(--ink-soft); font-size: 14.5px; }
+```
 
-.tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 18px; }
-.tab {
-  font-family: var(--mono); font-size: 12px; padding: 9px 14px;
-  background: var(--paper); border: 1px solid var(--rule); border-bottom: none;
-  border-radius: 6px 6px 0 0; cursor: pointer; color: var(--ink-soft);
-  position: relative; top: 1px;
+## 7. Harmonizer — 시스템 프롬프트
+
+```
+You are the Harmonizer in an S&OP reconciliation simulation, playing the role of an
+Integrated Planning Manager who sits between Sales and Supply/Procurement (and, when
+present, Finance). You have read all agents' positions (provided below).
+
+Your mandate:
+- Do not simply average the positions. Make a reasoned judgment call, the way an
+  experienced planning manager would in a live monthly S&OP meeting.
+- Weigh business risk (from Sales) against operational/financial risk (from
+  Procurement) explicitly.
+- Produce ONE final recommended volume per month — this is the plan that would go to
+  the executive S&OP meeting for sign-off.
+- CRITICAL — full traceability: an approver (e.g. Division Head) reviewing this must
+  be able to see, for EVERY month, what each side argued and exactly why you landed on
+  your final number. Never produce a final number without a month-specific reason tied
+  to the two agents' actual arguments. Do not give one generic rationale for the whole
+  period — reasoning can differ month to month (e.g. "sided with Sales in October
+  because churn risk outweighed lead-time cost" vs "sided with Procurement in November
+  because MOQ made partial fulfillment physically impossible").
+- Factor in inventory position (Procurement's inventory_position_note) explicitly: a
+  surplus (positive inventory_gap) is a reason to lean toward the lower/Procurement
+  number even if Sales' request is technically producible; a deficit (negative
+  inventory_gap) strengthens the case for the higher/Sales number.
+- If product_lifecycle_stage is "new_launch", explicitly flag in your reasoning that
+  Sales' forecast_basis is market-sizing/analog rather than trend data, and treat that
+  as higher uncertainty — consider recommending a more conservative number with a
+  faster review cycle (e.g. re-assess after the first month of actuals) rather than
+  committing fully to either side's number.
+- If a Finance Agent position is provided below, you MUST also decide on the pricing
+  action (hold / markdown / write-off), not just the volume. State whether you accept
+  Finance's recommendation or override it, and why — this decision affects the plan
+  just as much as the volume number does.
+- Flag any risk that remains even after your decision (e.g., "this still leaves a gap
+  vs Sales' request in November").
+
+Respond with ONLY a valid JSON object in this exact shape (omit "pricing_decision" ONLY
+if no Finance Agent position was provided):
+{
+  "agent": "harmonizer",
+  "decision_trace": [
+    {
+      "month": "<month>",
+      "sales_requested": <number>,
+      "procurement_max_feasible": <number>,
+      "final_decision": <number>,
+      "reasoning": "<1-2 sentence month-specific reason, referencing which of the two
+                     agents' arguments tipped the decision and why>"
+    }
+    // one entry per month in the scenario, in chronological order
+  ],
+  "pricing_decision": {
+    "action": "hold | markdown | write_off",
+    "accepted_finance_recommendation": true or false,
+    "rationale": "1-2 sentence explaining whether/why you accepted or overrode Finance's recommendation"
+  },
+  "key_rationale": ["<overall reason 1>", "<overall reason 2>", "<overall reason 3>"],
+  "risk_flags": ["<remaining risk 1>", "<remaining risk 2>"],
+  "executive_summary": "<3-4 sentence summary suitable for an executive S&OP readout>"
 }
-.tab.active {
-  background: var(--ink); color: var(--paper); border-color: var(--ink);
-  font-weight: 600;
-}
+```
 
-.dossier {
-  background: var(--paper); border: 1px solid var(--rule); border-radius: 0 6px 6px 6px;
-  padding: 22px 24px; margin-bottom: 20px;
-}
-.dossier h2 { font-family: var(--serif); font-size: 21px; margin: 0 0 4px; }
-.meta-row {
-  font-family: var(--mono); font-size: 12px; color: var(--ink-soft);
-  margin-bottom: 12px; display: flex; gap: 16px; flex-wrap: wrap;
-}
-.lifecycle-tag {
-  display: inline-block; padding: 1px 7px; border-radius: 3px;
-  background: var(--harm-bg); color: var(--harm); font-weight: 600;
-}
-.narrative { font-size: 14px; color: var(--ink); margin-bottom: 16px; }
+**설계 의도:** `decision_trace`는 UI에서 월별로 펼쳐볼 수 있는 "왜(Why)" 패널의 원본 데이터가 된다. 승인자는 최종 숫자만 보는 게 아니라, 각 월을 클릭하면 "Sales는 1,600을 요청했고 Procurement는 750까지만 가능하다고 했는데, Harmonizer가 1,200으로 결정한 이유는 ○○ 때문"이라는 근거를 바로 확인할 수 있다. `pricing_decision`은 Finance Agent가 참여했을 때만 등장하며, Harmonizer가 Finance의 제안을 그대로 받아들였는지 뒤집었는지까지 투명하게 남긴다. 이는 단순 자동화 도구가 아니라 **설명 가능한 의사결정(explainable decision-making)** 이라는 포트폴리오 차별점으로 직결된다.
 
-table.data-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
-table.data-table th {
-  text-align: right; padding: 6px 8px; border-bottom: 2px solid var(--ink);
-  color: var(--ink-soft); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em;
-}
-table.data-table th:first-child, table.data-table td:first-child { text-align: left; }
-table.data-table td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--rule); }
-.gap-pos { color: var(--surplus); font-weight: 600; }
-.gap-neg { color: var(--deficit); font-weight: 600; }
+## 8. API 호출 구조 (Claude Artifact 기준)
 
-.run-btn {
-  display: block; width: 100%; margin-top: 20px; padding: 14px;
-  background: var(--harm); color: var(--paper); border: none; border-radius: 6px;
-  font-family: var(--sans); font-size: 14.5px; font-weight: 700; letter-spacing: 0.02em;
-  cursor: pointer;
-}
-.run-btn:disabled { opacity: 0.5; cursor: default; }
-.run-btn:hover:not(:disabled) { filter: brightness(1.08); }
+```javascript
+const SYSTEM_PROMPTS = {
+  sales: `...(4번 시스템 프롬프트 전문)...`,
+  procurement: `...(5번 시스템 프롬프트 전문)...`,
+  finance: `...(6번 시스템 프롬프트 전문)...`,
+  harmonizer: `...(7번 시스템 프롬프트 전문)...`,
+};
 
-.status {
-  font-family: var(--mono); font-size: 12.5px; color: var(--ink-soft);
-  margin: 14px 0; min-height: 18px;
-}
-.status.active::before { content: "▸ "; color: var(--harm); }
+async function runSOPDebate(scenario) {
+  const scenarioContext = JSON.stringify(scenario);
 
-.testimony { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 20px 0; }
-@media (max-width: 700px) { .testimony { grid-template-columns: 1fr; } }
-.card { border-radius: 6px; padding: 18px 20px; border: 1px solid; }
-.card.sales { background: var(--sales-bg); border-color: var(--sales-line); }
-.card.proc { background: var(--proc-bg); border-color: var(--proc-line); }
-.card-label { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700; margin-bottom: 6px; }
-.card.sales .card-label { color: var(--sales); }
-.card.proc .card-label { color: var(--proc); }
-.position-summary { font-family: var(--serif); font-size: 15.5px; margin-bottom: 12px; }
-.card ul { margin: 0 0 12px; padding-left: 18px; font-size: 13.5px; }
-.card li { margin-bottom: 5px; }
-.card .note { font-size: 12.5px; color: var(--ink-soft); border-top: 1px dashed var(--rule); padding-top: 10px; margin-top: 10px; }
+  // Round 1: Sales
+  const salesRes = await callClaude(SYSTEM_PROMPTS.sales,
+    `Scenario data:\n${scenarioContext}`);
 
-.verdict {
-  background: var(--harm-bg); border: 1px solid var(--harm-line); border-radius: 6px;
-  padding: 22px 24px; margin: 20px 0;
-}
-.seal {
-  display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 700;
-  letter-spacing: 0.1em; color: var(--paper); background: var(--harm);
-  padding: 4px 10px; border-radius: 3px; margin-bottom: 12px;
-}
-.exec-summary { font-family: var(--serif); font-size: 16px; margin-bottom: 14px; }
-.verdict h4 { font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--harm); margin: 14px 0 6px; }
-.verdict ul { margin: 0; padding-left: 18px; font-size: 13.5px; }
-.risk-tag {
-  display: inline-block; font-size: 12px; padding: 3px 9px; border-radius: 3px;
-  background: #fff; border: 1px solid var(--deficit); color: var(--deficit); margin: 3px 6px 0 0;
-}
+  // Round 2: Procurement (sees Sales' output)
+  const procRes = await callClaude(SYSTEM_PROMPTS.procurement,
+    `Scenario data:\n${scenarioContext}\n\nSales Demand Agent's position:\n${JSON.stringify(salesRes)}`);
 
-.ledger { margin-top: 22px; }
-.ledger-title { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-soft); margin-bottom: 8px; }
-.ledger-row {
-  background: var(--paper); border: 1px solid var(--rule); border-radius: 4px;
-  margin-bottom: 6px; overflow: hidden;
-}
-.ledger-head {
-  display: grid; grid-template-columns: 90px 1fr 1fr 1fr 20px; gap: 10px;
-  padding: 10px 14px; cursor: pointer; align-items: center;
-  font-family: var(--mono); font-size: 12.5px;
-}
-.ledger-head .lbl { font-size: 9.5px; text-transform: uppercase; color: var(--ink-soft); display: block; }
-.ledger-head .arrow { text-align: right; color: var(--ink-soft); transition: transform 0.15s; }
-.ledger-row.open .arrow { transform: rotate(90deg); }
-.ledger-body {
-  display: none; padding: 0 14px 14px 14px; font-size: 13px; color: var(--ink);
-  border-top: 1px dashed var(--rule);
-}
-.ledger-row.open .ledger-body { display: block; padding-top: 10px; }
+  // Conditional Round: Finance Agent, ONLY if a dead-stock trigger exists in this scenario
+  let financeRes = null;
+  if (scenario.dead_stock_trigger_month) {
+    financeRes = await callClaude(SYSTEM_PROMPTS.finance,
+      `Scenario data:\n${scenarioContext}\n\nSales position:\n${JSON.stringify(salesRes)}\n\nProcurement position:\n${JSON.stringify(procRes)}`);
+  }
 
-.footer-note { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); margin-top: 40px; text-align: center; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="masthead">
-    <div class="eyebrow">SunArc Solar · Integrated Planning — Case File</div>
-    <h1>S&amp;OP Reconciliation Simulator</h1>
-    <div class="subtitle">Multi-agent simulation of a Sales–Supply demand/supply reconciliation, mediated by an Integrated Planning Manager persona (Harmonizer).</div>
-  </div>
+  // Final Round: Harmonizer (sees everything available)
+  let harmonizerContext = `Scenario data:\n${scenarioContext}\n\nSales position:\n${JSON.stringify(salesRes)}\n\nProcurement position:\n${JSON.stringify(procRes)}`;
+  if (financeRes) {
+    harmonizerContext += `\n\nFinance position:\n${JSON.stringify(financeRes)}`;
+  }
+  const harmonizerRes = await callClaude(SYSTEM_PROMPTS.harmonizer, harmonizerContext);
 
-  <div class="tabs" id="tabs"></div>
-  <div class="dossier" id="dossier"></div>
-  <button class="run-btn" id="runBtn">Convene S&amp;OP Review</button>
-  <div class="status" id="status"></div>
-
-  <div id="results"></div>
-
-  <div class="footer-note">All data is synthetic, for portfolio demonstration purposes only. Company and product names are fictional.</div>
-</div>
-
-<script>
-const SOP_DATA = {"meta": {"company_name": "SunArc Solar (fictional company)", "disclaimer": "모든 데이터는 포트폴리오 데모 목적의 가상 데이터이며, 특정 실존 기업의 데이터가 아닙니다.", "schema_version": "1.2", "target_inventory_months": 1.5, "unit_convention": {"module": "수량(quantity) 기준으로 입력하며, MWp = POWERCLASS(Wp) x 수량 / 10^6 으로 환산 (예: 590Wp x 30,500장 / 10^6 = 17.995 MWp)", "inverter": "units / 대수", "ess_battery": "units / 대수", "lead_time_baseline": "정상 기준 2~4개월 (약 8~16주). 공급 차질 시나리오는 이 밴드를 초과할 수 있음."}, "field_definitions": {"sales_forecast_request": "Sales팀이 요청하는 월별 물량 (제품별 단위는 scenario.unit 참조)", "current_supply_capacity": "해당 월 생산/조달 가능 물량 (동일 단위)", "lead_time_weeks": "발주 후 공급까지 소요되는 리드타임 (주 단위, 정상 기준 8~16주)", "moq": "최소발주단위", "unit_cost_eur": "단가 (EUR). 모듈은 MW당 단가, 인버터/ESS는 대당 단가.", "inventory_on_hand": "월초 기준 현재고 (동일 단위)", "target_inventory_level": "적정재고 수준 = sales_forecast_request(해당 월 수요 proxy) x target_inventory_months(1.5). Phase 1 단순화를 위해 해당 월 수요를 기준으로 산정 (향후 이동평균으로 고도화 가능)", "inventory_gap": "inventory_on_hand - target_inventory_level. 양수=재고 과잉(오버스톡), 음수=재고 부족(공급 시급성 높음)", "product_lifecycle_stage": "'established'(기존 제품, 과거 추세 기반 판단 가능) 또는 'new_launch'(신제품, 과거 데이터 없음)", "launch_month": "product_lifecycle_stage가 new_launch인 경우, 출시 월. established 제품은 null"}}, "scenarios": {"scenario_a_italy_surge": {"title": "Italy Inverter Demand Surge", "unit": "units (대수)", "product_lifecycle_stage": "established", "launch_month": null, "narrative_context": "이탈리아 C&I(상업/산업) 시장에서 3상 인버터 수요가 예상보다 빠르게 증가하고 있다. 경쟁사(가상명: VoltRax)가 유사 스펙 제품을 20% 낮은 가격에 공급하며 점유율을 확대 중이라는 시장 정보가 있다. Sales팀은 고객 이탈을 막기 위해 즉각적인 물량 확보를 요청하고 있으나, 현재 생산 공급망은 원자재 리드타임 문제로 여유가 크지 않다.", "product": "HYB-G3 Inverter 10kW 3P", "market": "Italy", "rows": [{"month": "2026-08", "sales_forecast_request": 850, "current_supply_capacity": 600, "lead_time_weeks": 10, "moq": 100, "unit_cost_eur": 890, "inventory_on_hand": 120, "target_inventory_level": 1275, "inventory_gap": -1155}, {"month": "2026-09", "sales_forecast_request": 1100, "current_supply_capacity": 650, "lead_time_weeks": 10, "moq": 100, "unit_cost_eur": 890, "inventory_on_hand": 0, "target_inventory_level": 1650, "inventory_gap": -1650}, {"month": "2026-10", "sales_forecast_request": 1400, "current_supply_capacity": 700, "lead_time_weeks": 12, "moq": 100, "unit_cost_eur": 905, "inventory_on_hand": 0, "target_inventory_level": 2100, "inventory_gap": -2100}, {"month": "2026-11", "sales_forecast_request": 1600, "current_supply_capacity": 750, "lead_time_weeks": 12, "moq": 100, "unit_cost_eur": 905, "inventory_on_hand": 0, "target_inventory_level": 2400, "inventory_gap": -2400}, {"month": "2026-12", "sales_forecast_request": 1750, "current_supply_capacity": 800, "lead_time_weeks": 14, "moq": 100, "unit_cost_eur": 920, "inventory_on_hand": 0, "target_inventory_level": 2625, "inventory_gap": -2625}]}, "scenario_b_poland_delay": {"title": "Poland Certification Delay", "unit": "units (대수)", "product_lifecycle_stage": "established", "launch_month": null, "narrative_context": "폴란드 정부의 계통연계 인증(가상 규제명: NC-RfG Type B) 갱신 절차가 예상보다 지연되며, 인증이 완료되지 않은 배터리 모델은 현지 판매가 불가능하다. Sales팀은 기존 계약된 물량을 차질 없이 공급해야 한다는 입장이고, Supply팀은 인증 완료 시점까지 공급 자체가 물리적으로 불가능하다는 입장이다 (정상 리드타임 대비 인증 지연으로 약 2개월 추가 지연).", "product": "ESS Battery Pack 5kWh", "market": "Poland", "rows": [{"month": "2026-08", "sales_forecast_request": 400, "current_supply_capacity": 400, "lead_time_weeks": 10, "moq": 50, "unit_cost_eur": 1450, "inventory_on_hand": 300, "target_inventory_level": 600, "inventory_gap": -300}, {"month": "2026-09", "sales_forecast_request": 450, "current_supply_capacity": 150, "lead_time_weeks": 18, "moq": 50, "unit_cost_eur": 1450, "inventory_on_hand": 0, "target_inventory_level": 675, "inventory_gap": -675}, {"month": "2026-10", "sales_forecast_request": 500, "current_supply_capacity": 100, "lead_time_weeks": 20, "moq": 50, "unit_cost_eur": 1470, "inventory_on_hand": 0, "target_inventory_level": 750, "inventory_gap": -750}, {"month": "2026-11", "sales_forecast_request": 500, "current_supply_capacity": 350, "lead_time_weeks": 14, "moq": 50, "unit_cost_eur": 1470, "inventory_on_hand": 0, "target_inventory_level": 750, "inventory_gap": -750}, {"month": "2026-12", "sales_forecast_request": 550, "current_supply_capacity": 500, "lead_time_weeks": 10, "moq": 50, "unit_cost_eur": 1470, "inventory_on_hand": 0, "target_inventory_level": 825, "inventory_gap": -825}]}, "scenario_c_germany_oversupply": {"title": "Germany Residential Battery Oversupply", "unit": "units (대수)", "product_lifecycle_stage": "established", "launch_month": null, "narrative_context": "독일 주거용 배터리 시장의 정부 보조금(가상: KfW-Home Storage Incentive)이 예상보다 일찍 축소되며 실수요가 둔화됐다. Sales팀 예측치는 기존 계약 기준으로 유지되고 있으나 실제 판매 속도는 하락 중이며, 창고에는 이미 상당한 재고가 쌓여 있다. Supply팀은 추가 생산을 즉시 중단하고 가격 조정(프로모션)을 통한 재고 소진을 제안하고 있다.", "product": "Residential Battery 5kWh", "market": "Germany", "rows": [{"month": "2026-08", "sales_forecast_request": 900, "current_supply_capacity": 900, "lead_time_weeks": 10, "moq": 100, "unit_cost_eur": 1200, "inventory_on_hand": 1800, "target_inventory_level": 1350, "inventory_gap": 450}, {"month": "2026-09", "sales_forecast_request": 850, "current_supply_capacity": 900, "lead_time_weeks": 10, "moq": 100, "unit_cost_eur": 1200, "inventory_on_hand": 2400, "target_inventory_level": 1275, "inventory_gap": 1125}, {"month": "2026-10", "sales_forecast_request": 800, "current_supply_capacity": 900, "lead_time_weeks": 10, "moq": 100, "unit_cost_eur": 1180, "inventory_on_hand": 3050, "target_inventory_level": 1200, "inventory_gap": 1850}, {"month": "2026-11", "sales_forecast_request": 750, "current_supply_capacity": 900, "lead_time_weeks": 10, "moq": 100, "unit_cost_eur": 1180, "inventory_on_hand": 3700, "target_inventory_level": 1125, "inventory_gap": 2575}, {"month": "2026-12", "sales_forecast_request": 700, "current_supply_capacity": 900, "lead_time_weeks": 10, "moq": 100, "unit_cost_eur": 1150, "inventory_on_hand": 4350, "target_inventory_level": 1050, "inventory_gap": 3300}]}, "scenario_d_france_module": {"title": "France Module Capacity Allocation", "unit": "modules (quantity); MWp derived via POWERCLASS(Wp) x quantity / 10^6", "powerclass_wp": 590, "product_lifecycle_stage": "established", "launch_month": null, "narrative_context": "프랑스 유틸리티 스케일 프로젝트향 모듈 수주가 늘며 Sales팀은 해당 고객사에 배정할 모듈 물량(MWp 기준) 확대를 요청하고 있다. 그러나 전체 생산 CAPA는 여러 국가 물량에 분산 배정되어야 하며, 특정 국가에 과도하게 배정할 경우 다른 시장向 공급에 차질이 생길 수 있다는 것이 Supply팀의 입장이다. 원자재(웨이퍼) 조달 리드타임도 고려 대상이다.", "product": "Q.TRON Module (가상 모델명, 590Wp)", "market": "France", "rows": [{"month": "2026-08", "sales_forecast_request": 30500, "current_supply_capacity": 23700, "lead_time_weeks": 10, "moq": 500, "unit_cost_eur": 56, "inventory_on_hand": 3400, "sales_forecast_mwp": 17.995, "current_supply_capacity_mwp": 13.983, "target_inventory_level": 45750, "inventory_gap": -42350}, {"month": "2026-09", "sales_forecast_request": 37300, "current_supply_capacity": 25400, "lead_time_weeks": 11, "moq": 500, "unit_cost_eur": 55, "inventory_on_hand": 0, "sales_forecast_mwp": 22.007, "current_supply_capacity_mwp": 14.986, "target_inventory_level": 55950, "inventory_gap": -55950}, {"month": "2026-10", "sales_forecast_request": 44100, "current_supply_capacity": 27100, "lead_time_weeks": 12, "moq": 500, "unit_cost_eur": 55, "inventory_on_hand": 0, "sales_forecast_mwp": 26.019, "current_supply_capacity_mwp": 15.989, "target_inventory_level": 66150, "inventory_gap": -66150}, {"month": "2026-11", "sales_forecast_request": 47500, "current_supply_capacity": 28800, "lead_time_weeks": 12, "moq": 500, "unit_cost_eur": 54, "inventory_on_hand": 0, "sales_forecast_mwp": 28.025, "current_supply_capacity_mwp": 16.992, "target_inventory_level": 71250, "inventory_gap": -71250}, {"month": "2026-12", "sales_forecast_request": 50800, "current_supply_capacity": 30500, "lead_time_weeks": 14, "moq": 500, "unit_cost_eur": 54, "inventory_on_hand": 0, "sales_forecast_mwp": 29.972, "current_supply_capacity_mwp": 17.995, "target_inventory_level": 76200, "inventory_gap": -76200}]}, "scenario_e_new_launch": {"title": "Germany New Compact ESS Launch", "unit": "units (대수)", "product_lifecycle_stage": "new_launch", "launch_month": "2026-10", "narrative_context": "신제품 Q.SAVE Compact 3kWh가 2026년 10월 독일 시장에 출시될 예정이다. 과거 판매 데이터가 존재하지 않아, Sales팀의 요청 물량은 유사 제품(기존 5kWh 모델)의 초기 3개월 판매 추이와 시장 규모 추정(market sizing)에 기반한 것이며 실제 트렌드 데이터가 아니다. 신규 생산 라인은 출시 초기 램프업 단계로, 정상 CAPA의 60~80% 수준에서 시작해 점진적으로 확대된다. 이 시나리오는 Agent가 '과거 추세 연장'이 아니라 '유사 제품 유추 + 시장 추정'이라는 다른 근거로 판단해야 함을 보여주기 위한 것이다.", "product": "Q.SAVE Compact 3kWh (NEW)", "market": "Germany", "rows": [{"month": "2026-10", "sales_forecast_request": 300, "current_supply_capacity": 180, "lead_time_weeks": 12, "moq": 50, "unit_cost_eur": 780, "inventory_on_hand": 0, "target_inventory_level": 450, "inventory_gap": -450}, {"month": "2026-11", "sales_forecast_request": 480, "current_supply_capacity": 260, "lead_time_weeks": 12, "moq": 50, "unit_cost_eur": 770, "inventory_on_hand": 0, "target_inventory_level": 720, "inventory_gap": -720}, {"month": "2026-12", "sales_forecast_request": 620, "current_supply_capacity": 380, "lead_time_weeks": 10, "moq": 50, "unit_cost_eur": 760, "inventory_on_hand": 0, "target_inventory_level": 930, "inventory_gap": -930}]}}};
-const SALES_PROMPT = "You are the Sales Demand Agent in an S&OP (Sales & Operations Planning) reconciliation simulation. Your role is to represent the commercial/market perspective.\n\nYour mandate:\n- Advocate for securing enough supply volume to capture market opportunity and protect against customer churn or competitive loss.\n- Base every argument on the specific numeric data provided (sales_forecast_request, market/competitive context in narrative_context). Do not invent numbers not present in the data.\n- Check product_lifecycle_stage. If it is \"established\", you may reason from the trend across months as if it reflects real historical momentum. If it is \"new_launch\" (see launch_month), there is NO real sales history - say so explicitly, and instead ground your argument in market-sizing logic and analogy to a comparable existing product (as described in narrative_context). Flag that your forecast confidence is lower than for an established product.\n- Be persuasive but professional. Acknowledge supply constraints exist, but argue why the business risk of under-supplying outweighs the operational difficulty.\n- Quantify the downside: estimate revenue-at-risk or churn risk in plain business terms based on the gap between sales_forecast_request and current_supply_capacity.\n\nRespond with ONLY a valid JSON object, no markdown fences, no preamble, in this exact shape:\n{\n  \"agent\": \"sales_demand\",\n  \"position_summary\": \"1-2 sentence summary of your stance\",\n  \"key_arguments\": [\"argument 1\", \"argument 2\", \"argument 3\"],\n  \"requested_volume_by_month\": {\"month\": number},\n  \"forecast_basis\": \"trend-based, or market-sizing/analog for new launches, with 1 sentence explaining which\",\n  \"business_risk_if_denied\": \"1-2 sentence risk statement\"\n}";
-const PROCUREMENT_PROMPT = "You are the Supply/Procurement Agent in an S&OP reconciliation simulation. Your role is to represent operational feasibility and cost discipline.\n\nYour mandate:\n- You have just read the Sales Demand Agent's argument (provided below). Respond directly to their specific requested volumes.\n- Base every argument on the specific numeric data provided (current_supply_capacity, lead_time_weeks, moq, unit_cost_eur, inventory_on_hand). Do not invent numbers not present in the data.\n- Identify precisely which months the requested volume exceeds feasible capacity, and by how much.\n- Inventory position matters: the target inventory level is 1.5 months of demand (target_inventory_level in the data). If inventory_gap is positive (existing stock already exceeds 1.5 months of demand), argue for restraint even if Sales' request looks feasible. If inventory_gap is negative (stock is below the 1.5-month target), that strengthens the case for approving more supply.\n- Where possible, propose a constructive alternative (partial fulfillment, phased ramp-up, expedited lead time at cost premium) rather than a flat refusal. If genuinely infeasible for a given month, say so clearly.\n\nRespond with ONLY a valid JSON object, no markdown fences, no preamble, in this exact shape:\n{\n  \"agent\": \"supply_procurement\",\n  \"position_summary\": \"1-2 sentence summary of your stance\",\n  \"key_arguments\": [\"argument 1\", \"argument 2\", \"argument 3\"],\n  \"max_feasible_volume_by_month\": {\"month\": number},\n  \"inventory_position_note\": \"1 sentence noting surplus or deficit vs the 1.5-month target and how it affects your position\",\n  \"proposed_alternative\": \"1-2 sentence constructive proposal, if any\"\n}";
-const HARMONIZER_PROMPT = "You are the Harmonizer in an S&OP reconciliation simulation, playing the role of an Integrated Planning Manager who sits between Sales and Supply/Procurement. You have read both agents' positions (provided below).\n\nYour mandate:\n- Do not simply average the two positions. Make a reasoned judgment call, the way an experienced planning manager would in a live monthly S&OP meeting.\n- Weigh business risk (from Sales) against operational/financial risk (from Procurement) explicitly.\n- Produce ONE final recommended volume per month.\n- CRITICAL - full traceability: an approver reviewing this must be able to see, for EVERY month, what each side argued and exactly why you landed on your final number. Reasoning can differ month to month.\n- Factor in inventory position explicitly: a surplus is a reason to lean toward the lower/Procurement number even if Sales' request is technically producible; a deficit strengthens the case for the higher/Sales number.\n- If product_lifecycle_stage is \"new_launch\", flag that Sales' forecast_basis is market-sizing/analog rather than trend data, treat as higher uncertainty, and consider a more conservative number with a faster review cycle.\n- Flag any risk that remains even after your decision.\n\nRespond with ONLY a valid JSON object, no markdown fences, no preamble, in this exact shape:\n{\n  \"agent\": \"harmonizer\",\n  \"decision_trace\": [\n    {\"month\": \"month\", \"sales_requested\": number, \"procurement_max_feasible\": number, \"final_decision\": number, \"reasoning\": \"1-2 sentence month-specific reason\"}\n  ],\n  \"key_rationale\": [\"overall reason 1\", \"overall reason 2\", \"overall reason 3\"],\n  \"risk_flags\": [\"remaining risk 1\", \"remaining risk 2\"],\n  \"executive_summary\": \"3-4 sentence summary suitable for an executive S&OP readout\"\n}";
-
-const scenarioKeys = Object.keys(SOP_DATA.scenarios);
-let currentKey = scenarioKeys[0];
-
-function fmt(n) { return typeof n === "number" ? n.toLocaleString() : n; }
-
-function renderTabs() {
-  const tabs = document.getElementById("tabs");
-  tabs.innerHTML = scenarioKeys.map((k, i) => {
-    const label = "SCN-" + String.fromCharCode(65 + i);
-    return `<div class="tab ${k === currentKey ? "active" : ""}" data-key="${k}">${label}</div>`;
-  }).join("");
-  tabs.querySelectorAll(".tab").forEach(el => {
-    el.addEventListener("click", () => {
-      currentKey = el.dataset.key;
-      document.getElementById("results").innerHTML = "";
-      document.getElementById("status").textContent = "";
-      renderTabs();
-      renderDossier();
-    });
-  });
-}
-
-function renderDossier() {
-  const sc = SOP_DATA.scenarios[currentKey];
-  const lifecycleTag = sc.product_lifecycle_stage === "new_launch"
-    ? `<span class="lifecycle-tag">NEW LAUNCH · ${sc.launch_month}</span>`
-    : `<span class="meta-row">established product</span>`;
-
-  const isModule = "powerclass_wp" in sc;
-  let headerCols = ["Month", "Sales Req", "Supply Cap", "Lead Time", "Inventory", "Target (1.5mo)", "Gap"];
-  let rowsHtml = sc.rows.map(r => {
-    const gapClass = r.inventory_gap >= 0 ? "gap-pos" : "gap-neg";
-    const gapLabel = r.inventory_gap >= 0 ? "+" + fmt(r.inventory_gap) : fmt(r.inventory_gap);
-    return `<tr>
-      <td>${r.month}</td>
-      <td>${fmt(r.sales_forecast_request)}</td>
-      <td>${fmt(r.current_supply_capacity)}</td>
-      <td>${r.lead_time_weeks}w</td>
-      <td>${fmt(r.inventory_on_hand)}</td>
-      <td>${fmt(r.target_inventory_level)}</td>
-      <td class="${gapClass}">${gapLabel}</td>
-    </tr>`;
-  }).join("");
-
-  document.getElementById("dossier").innerHTML = `
-    <h2>${sc.title}</h2>
-    <div class="meta-row">
-      <span>PRODUCT: ${sc.product}</span>
-      <span>MARKET: ${sc.market}</span>
-      <span>UNIT: ${sc.unit}</span>
-      ${lifecycleTag}
-    </div>
-    <div class="narrative">${sc.narrative_context}</div>
-    <table class="data-table">
-      <thead><tr>${headerCols.map(h => `<th>${h}</th>`).join("")}</tr></thead>
-      <tbody>${rowsHtml}</tbody>
-    </table>
-  `;
+  return { sales: salesRes, procurement: procRes, finance: financeRes, harmonizer: harmonizerRes };
 }
 
 async function callClaude(systemPrompt, userMessage) {
@@ -250,98 +262,31 @@ async function callClaude(systemPrompt, userMessage) {
     }),
   });
   const data = await response.json();
-  const block = (data.content || []).find(b => b.type === "text");
-  const text = block ? block.text : "{}";
-  const cleaned = text.replace(/```json|```/g, "").trim();
-  try { return JSON.parse(cleaned); } catch (e) { return { error: "Could not parse response", raw: text }; }
+  const text = data.content.find(b => b.type === "text")?.text || "{}";
+  return JSON.parse(text.replace(/```json|```/g, "").trim());
 }
+```
 
-function setStatus(msg) {
-  const el = document.getElementById("status");
-  el.textContent = msg;
-  el.className = msg ? "status active" : "status";
-}
+**호출 횟수:** 데드스탁 트리거가 없으면 3회(Sales/Procurement/Harmonizer), 트리거가 있으면 4회(+ Finance). `scenario.dead_stock_trigger_month`는 build_data.py에서 이미 계산되어 데이터에 포함되어 있으므로, UI 코드는 이 값의 존재 여부만 확인하면 된다 — 별도의 판단 로직을 프론트엔드에 새로 만들 필요가 없다.
 
-function renderResults(sales, proc, harm) {
-  const risksHtml = (harm.risk_flags || []).map(r => `<span class="risk-tag">${r}</span>`).join("");
-  const traceHtml = (harm.decision_trace || []).map(t => `
-    <div class="ledger-row">
-      <div class="ledger-head" onclick="this.parentElement.classList.toggle('open')">
-        <span>${t.month}</span>
-        <span><span class="lbl">Sales req</span>${fmt(t.sales_requested)}</span>
-        <span><span class="lbl">Procurement max</span>${fmt(t.procurement_max_feasible)}</span>
-        <span><span class="lbl">Final decision</span>${fmt(t.final_decision)}</span>
-        <span class="arrow">▸</span>
-      </div>
-      <div class="ledger-body">${t.reasoning}</div>
-    </div>
-  `).join("");
+## 9. 모듈 시나리오(D) 관련 주의사항
 
-  document.getElementById("results").innerHTML = `
-    <div class="testimony">
-      <div class="card sales">
-        <div class="card-label">Sales Demand Agent</div>
-        <div class="position-summary">${sales.position_summary || ""}</div>
-        <ul>${(sales.key_arguments || []).map(a => `<li>${a}</li>`).join("")}</ul>
-        <div class="note"><strong>Forecast basis:</strong> ${sales.forecast_basis || "—"}<br>
-        <strong>Risk if denied:</strong> ${sales.business_risk_if_denied || "—"}</div>
-      </div>
-      <div class="card proc">
-        <div class="card-label">Supply / Procurement Agent</div>
-        <div class="position-summary">${proc.position_summary || ""}</div>
-        <ul>${(proc.key_arguments || []).map(a => `<li>${a}</li>`).join("")}</ul>
-        <div class="note"><strong>Inventory position:</strong> ${proc.inventory_position_note || "—"}<br>
-        <strong>Proposed alternative:</strong> ${proc.proposed_alternative || "—"}</div>
-      </div>
-    </div>
+시나리오 D(France Module)는 수량(quantity) 기반 데이터에 `powerclass_wp`가 별도로 붙어 있다. Agent 프롬프트에 시나리오 데이터를 전달할 때 `powerclass_wp`와 파생된 `*_mwp` 필드를 함께 전달해, Agent가 "30,500장(약 18.0MWp)" 같은 형태로 자연스럽게 언급할 수 있게 한다. Agent가 직접 MWp를 재계산할 필요는 없다 — 이미 계산된 값을 참고 정보로 준다.
 
-    <div class="verdict">
-      <div class="seal">Harmonizer · Final Decision</div>
-      <div class="exec-summary">${harm.executive_summary || ""}</div>
-      <h4>Key Rationale</h4>
-      <ul>${(harm.key_rationale || []).map(r => `<li>${r}</li>`).join("")}</ul>
-      <h4>Remaining Risk Flags</h4>
-      <div>${risksHtml || "—"}</div>
-    </div>
+## 10. 승인자(Approver) 뷰 UI 요구사항
 
-    <div class="ledger">
-      <div class="ledger-title">Decision Trace — click a month to see why</div>
-      ${traceHtml}
-    </div>
-  `;
-}
+이 요구사항은 Phase 1 Artifact 빌드 시 UI 설계에 직접 반영된다.
 
-document.getElementById("runBtn").addEventListener("click", async () => {
-  const btn = document.getElementById("runBtn");
-  btn.disabled = true;
-  document.getElementById("results").innerHTML = "";
-  const sc = SOP_DATA.scenarios[currentKey];
-  const scenarioContext = JSON.stringify(sc);
+- **팀별 아규먼트 노출:** Sales Demand Agent와 Supply/Procurement Agent의 `key_arguments`를 각각 별도 카드(채팅 버블)로 나란히 또는 순차적으로 표시한다. 승인자가 "누가 뭐라고 주장했는지" 원문 그대로 확인 가능해야 한다.
+- **Finance Agent 카드(조건부):** `scenario.dead_stock_trigger_month`가 있어 Finance Agent가 소집된 경우에만, Sales/Procurement 카드 아래 별도 카드로 표시한다. `options_considered`(hold/markdown/write_off 각각의 비용/효과)를 승인자가 세 옵션을 나란히 비교할 수 있게 렌더링한다.
+- **가격 결정 투명성:** Harmonizer의 `pricing_decision.accepted_finance_recommendation`이 false인 경우(Finance 제안을 뒤집은 경우), 이를 눈에 띄게 강조 표시한다 — "Finance는 마크다운을 제안했으나 Harmonizer가 유지(hold)로 결정" 같은 문구가 숨겨지지 않아야 한다.
+- **월별 Decision Trace 펼쳐보기:** Harmonizer의 `executive_summary`/`key_rationale`(요약)만 기본 노출하고, 그 아래 월별 아코디언(또는 테이블)으로 `decision_trace`를 배치한다. 각 행을 클릭하면 해당 월의 Sales 요청치·Procurement 가능치·최종 결정치·근거 문장이 함께 펼쳐진다.
+- **근거 없는 숫자 금지:** UI 상에서 `decision_trace`에 없는 월이 있으면 데이터 누락으로 간주하고, 최종 결정 숫자만 있고 근거가 없는 상태로 렌더링되지 않도록 한다.
 
-  try {
-    setStatus("Sales Demand Agent is drafting its position...");
-    const sales = await callClaude(SALES_PROMPT, "Scenario data:\n" + scenarioContext);
+## 11. 다음 단계
 
-    setStatus("Supply/Procurement Agent is reviewing and responding...");
-    const proc = await callClaude(PROCUREMENT_PROMPT,
-      "Scenario data:\n" + scenarioContext + "\n\nSales Demand Agent's position:\n" + JSON.stringify(sales));
+이 프롬프트들을 실제로 Claude Artifact(React)에 넣어 인터랙티브 데모를 빌드하는 것이 Phase 1의 마지막 작업이다.
 
-    setStatus("Harmonizer is deliberating a final decision...");
-    const harm = await callClaude(HARMONIZER_PROMPT,
-      "Scenario data:\n" + scenarioContext +
-      "\n\nSales position:\n" + JSON.stringify(sales) +
-      "\n\nProcurement position:\n" + JSON.stringify(proc));
+---
 
-    setStatus("");
-    renderResults(sales, proc, harm);
-  } catch (err) {
-    setStatus("Error: " + err.message);
-  }
-  btn.disabled = false;
-});
-
-renderTabs();
-renderDossier();
-</script>
-</body>
-</html>
+*버전 히스토리: v1.0(최초 작성) — Agent 3종 시스템 프롬프트, JSON 출력 계약, API 호출 구조 확정*
